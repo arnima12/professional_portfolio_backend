@@ -14,26 +14,25 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Set up multer for file storage
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, './upload');
-    },
-    filename: function (req, file, cb) {
-        cb(null, Date.now() + path.extname(file.originalname));
-    }
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-const upload = multer({
-    storage: storage,
-    fileFilter: function (req, file, cb) {
-
-        if (!file.mimetype.startsWith('image/') && !file.mimetype.startsWith('video/')) {
-            return cb(new Error('Only image and video files are allowed'), false);
-        }
-        cb(null, true);
+const storage = new CloudinaryStorage({
+    cloudinary: cloudinary,
+    params: {
+        folder: 'uploads', // Optional folder name in Cloudinary
+        allowed_formats: ['jpg', 'png', 'jpeg', 'gif', 'mp4'],
     },
-    limits: { fileSize: 20 * 1024 * 1024 }
 });
+
+const upload = multer({ storage });
+
 
 // MongoDB connection
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.mwroqof.mongodb.net/`;
