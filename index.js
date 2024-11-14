@@ -2,8 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const { MongoClient } = require('mongodb');
 require('dotenv').config();
-const multer = require('multer');
-const path = require('path');
 const jwt = require('jsonwebtoken')
 const app = express();
 const port = process.env.PORT || 8000;
@@ -14,24 +12,31 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Set up multer for file storage
-const cloudinary = require('cloudinary').v2;
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const multer = require('multer');
+const cloudinary = require('cloudinary').v2;  // Cloudinary SDK
+const path = require('path');
 
+// Configure Cloudinary
 cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET,
+    api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-const storage = new CloudinaryStorage({
-    cloudinary: cloudinary,
-    params: {
-        folder: 'uploads', // Optional folder name in Cloudinary
-        allowed_formats: ['jpg', 'png', 'jpeg', 'gif', 'mp4'],
+// Use Multer for in-memory storage (no local file storage)
+const storage = multer.memoryStorage(); // Store files in memory
+
+const upload = multer({
+    storage: storage,
+    fileFilter: function (req, file, cb) {
+        // Check file type for image or video
+        if (!file.mimetype.startsWith('image/') && !file.mimetype.startsWith('video/')) {
+            return cb(new Error('Only image and video files are allowed'), false);
+        }
+        cb(null, true);
     },
+    limits: { fileSize: 20 * 1024 * 1024 } // 20MB file size limit
 });
-
-const upload = multer({ storage });
 
 
 // MongoDB connection
@@ -189,54 +194,121 @@ connectToDB().then(() => {
             }
 
             let updateFields = {};
+
+            // Upload 'image' to Cloudinary if provided
             if (req.files['image']) {
                 const imageFile = req.files['image'][0];
-                const imageUrl = `http://localhost:8000/uploads/${imageFile.filename}`;
-                updateFields.image = imageUrl;
-            }
-            let fieldEducation = Array.isArray(education) ? education : JSON.parse(education);
+                const uploadStream = cloudinary.uploader.upload_stream(
+                    { resource_type: 'auto' }, // auto for both image/video
+                    async (error, result) => {
+                        if (error) {
+                            console.error('Error uploading image to Cloudinary:', error);
+                            return res.status(500).send({ message: 'Error uploading image to Cloudinary', error: error.message });
+                        }
 
-            fieldEducation = fieldEducation.map((edu, index) => {
-                if (req.files[`education[${index}][logo]`]) {
-                    const newLogoFile = req.files[`education[${index}][logo]`][0];
-                    edu.logo = `http://localhost:8000/uploads/${newLogoFile.filename}`;
-                } else {
-                    if (user.education && user.education[index] && user.education[index].logo) {
-                        edu.logo = user.education[index].logo;
+                        updateFields.image = result.secure_url; // Cloudinary URL for image
+
+                        // Now handle education logos
+                        let fieldEducation = Array.isArray(education) ? education : JSON.parse(education);
+
+                        fieldEducation = fieldEducation.map((edu, index) => {
+                            if (req.files[`education[${index}][logo]`]) {
+                                const logoFile = req.files[`education[${index}][logo]`][0];
+                                const logoUploadStream = cloudinary.uploader.upload_stream(
+                                    { resource_type: 'auto' },
+                                    (logoError, logoResult) => {
+                                        if (logoError) {
+                                            console.error('Error uploading logo to Cloudinary:', logoError);
+                                            return res.status(500).send({ message: 'Error uploading logo to Cloudinary', error: logoError.message });
+                                        }
+
+                                        edu.logo = logoResult.secure_url; // Cloudinary URL for logo
+                                        return edu;
+                                    }
+                                );
+                                logoFile.stream.pipe(logoUploadStream);
+                            } else {
+                                if (user.education && user.education[index] && user.education[index].logo) {
+                                    edu.logo = user.education[index].logo;
+                                }
+                            }
+                            return edu;
+                        });
+
+                        const fieldExperience = Array.isArray(experience) ? experience : JSON.parse(experience);
+
+                        const updateObject = {
+                            $set: {
+                                name,
+                                bio,
+                                gender,
+                                dob,
+                                phone,
+                                profession,
+                                email: userEmail,
+                                linkedin,
+                                facebook,
+                                youtube,
+                                address,
+                                experience: fieldExperience,
+                                education: fieldEducation,
+                                ...updateFields
+                            }
+                        };
+
+                        const resultUpdate = await usersCollection.updateOne({ email: userEmail }, updateObject);
+
+                        if (resultUpdate.modifiedCount > 0) {
+                            res.status(200).send({ message: 'User updated successfully' });
+                        } else {
+                            res.status(200).send({ message: 'No changes made to the user' });
+                        }
                     }
-                }
-                return edu;
-            });
-
-
-            const fieldExperience = Array.isArray(experience) ? experience : JSON.parse(experience);
-
-
-            const updateObject = {
-                $set: {
-                    name,
-                    bio,
-                    gender,
-                    dob,
-                    phone,
-                    profession,
-                    email: userEmail,
-                    linkedin,
-                    facebook,
-                    youtube,
-                    address,
-                    experience: fieldExperience,
-                    education: fieldEducation,
-                    ...updateFields
-                }
-            };
-
-            const result = await usersCollection.updateOne({ email: userEmail }, updateObject);
-
-            if (result.modifiedCount > 0) {
-                res.status(200).send({ message: 'User updated successfully' });
+                );
+                imageFile.stream.pipe(uploadStream);
             } else {
-                res.status(200).send({ message: 'No changes made to the user' });
+                // If no image provided, update other fields
+                let fieldEducation = Array.isArray(education) ? education : JSON.parse(education);
+                fieldEducation = fieldEducation.map((edu, index) => {
+                    if (req.files[`education[${index}][logo]`]) {
+                        const newLogoFile = req.files[`education[${index}][logo]`][0];
+                        edu.logo = `http://localhost:8000/uploads/${newLogoFile.filename}`;
+                    } else {
+                        if (user.education && user.education[index] && user.education[index].logo) {
+                            edu.logo = user.education[index].logo;
+                        }
+                    }
+                    return edu;
+                });
+
+                const fieldExperience = Array.isArray(experience) ? experience : JSON.parse(experience);
+
+                const updateObject = {
+                    $set: {
+                        name,
+                        bio,
+                        gender,
+                        dob,
+                        phone,
+                        profession,
+                        email: userEmail,
+                        linkedin,
+                        facebook,
+                        youtube,
+                        address,
+                        experience: fieldExperience,
+                        education: fieldEducation,
+                        ...updateFields
+                    }
+                };
+
+                const resultUpdate = await usersCollection.updateOne({ email: userEmail }, updateObject);
+
+                if (resultUpdate.modifiedCount > 0) {
+                    res.status(200).send({ message: 'User updated successfully' });
+                } else {
+                    res.status(200).send({ message: 'No changes made to the user' });
+                }
             }
         } catch (error) {
             console.error('Error updating user:', error);
@@ -309,24 +381,43 @@ connectToDB().then(() => {
     });
     app.patch('/users/:email/update-logo', upload.single('logo'), async (req, res) => {
         const userEmail = req.params.email;
-        const logoPath = req.file ? req.file.path : null;
+        const logoFile = req.file; // File from the upload
 
-        const logoUrl = logoPath ? `http://localhost:8000/uploads/${path.basename(logoPath)}` : null;
+        if (!logoFile) {
+            return res.status(400).send({ message: 'No logo file uploaded' });
+        }
 
         try {
-            const user = await usersCollection.findOne({ email: userEmail });
-            if (!user) {
-                return res.status(404).send({ message: 'User not found' });
-            }
+            // Upload file to Cloudinary (using in-memory buffer)
+            const result = await cloudinary.uploader.upload_stream(
+                { resource_type: 'auto' }, // auto for image and video
+                async (error, result) => {
+                    if (error) {
+                        return res.status(500).send({ message: 'Error uploading to Cloudinary', error: error.message });
+                    }
 
-            const update = { $set: { logo: logoUrl } };
-            const result = await usersCollection.updateOne({ email: userEmail }, update);
+                    const logoUrl = result.secure_url; // Get the URL of the uploaded image
 
-            if (result.modifiedCount > 0) {
-                res.status(200).send({ message: 'Logo updated successfully', url: logoUrl });
-            } else {
-                res.status(200).send({ message: 'No changes made to the user' });
-            }
+                    // Update user in MongoDB
+                    const user = await usersCollection.findOne({ email: userEmail });
+                    if (!user) {
+                        return res.status(404).send({ message: 'User not found' });
+                    }
+
+                    const update = { $set: { logo: logoUrl } };
+                    const updateResult = await usersCollection.updateOne({ email: userEmail }, update);
+
+                    if (updateResult.modifiedCount > 0) {
+                        res.status(200).send({ message: 'Logo updated successfully', url: logoUrl });
+                    } else {
+                        res.status(200).send({ message: 'No changes made to the user' });
+                    }
+                }
+            );
+
+            // Pipe the file buffer to Cloudinary upload stream
+            logoFile.stream.pipe(result);
+
         } catch (error) {
             console.error('Error updating logo:', error);
             res.status(500).send({ message: 'Error updating logo', error: error.message });
@@ -342,27 +433,48 @@ connectToDB().then(() => {
         console.log("Data:", data);
 
         const titles = Array.isArray(data.titles) ? data.titles : [];
-        console.log("titles", titles)
+        console.log("titles", titles);
+
         try {
             const user = await usersCollection.findOne({ email: userEmail });
             if (!user) {
                 return res.status(404).send({ message: 'User not found' });
             }
-            const galleryUrls = files.map(file => `http://localhost:8000/uploads/${file.filename}`);
-            console.log("galleryUrls", galleryUrls)
+
+            // Upload images to Cloudinary and get URLs
+            const uploadPromises = files.map(file => {
+                return new Promise((resolve, reject) => {
+                    cloudinary.uploader.upload(file.path, { folder: 'user_gallery' }, (error, result) => {
+                        if (error) {
+                            reject(error);
+                        } else {
+                            resolve(result.secure_url);
+                        }
+                    });
+                });
+            });
+
+            // Resolve all upload promises to get the Cloudinary URLs
+            const galleryUrls = await Promise.all(uploadPromises);
+            console.log("galleryUrls", galleryUrls);
+
+            // Ensure titles match the number of uploaded images
             const paddedTitles = [...titles, ...Array(files.length - titles.length).fill('Untitled')];
 
+            // Combine URLs with titles
             const galleryWithTitles = galleryUrls.map((url, index) => ({
                 image: url,
                 title: paddedTitles[index]
             }));
 
+            // Update the user's gallery
             const updateObject = {
                 $push: { gallery: { $each: galleryWithTitles } }
             };
 
             const result = await usersCollection.updateOne({ email: userEmail }, updateObject);
             console.log(result);
+
             if (result.modifiedCount > 0) {
                 res.status(200).send({ message: 'Gallery updated successfully', gallery: galleryWithTitles });
             } else {
@@ -374,6 +486,7 @@ connectToDB().then(() => {
             res.status(500).send({ message: 'Error updating gallery', error: error.message });
         }
     });
+
     app.delete('/users/:email/permanent-delete', async (req, res) => {
         const userEmail = req.params.email;
         const { category, title } = req.query;
@@ -417,37 +530,50 @@ connectToDB().then(() => {
         const data = req.body;
         const titles = Array.isArray(data.titles) ? data.titles : [];
 
-
         try {
             const user = await usersCollection.findOne({ email: userEmail });
             if (!user) {
                 return res.status(404).send({ message: 'User not found' });
             }
 
-            const videoUrls = files.map(file => `http://localhost:8000/uploads/${file.filename}`);
+            // Upload videos to Cloudinary and get the URLs
+            const videoUrls = [];
+            for (const file of files) {
+                const result = await cloudinary.uploader.upload(file.path, {
+                    resource_type: 'video', // Specify that it's a video
+                    folder: 'user_videos',  // Optional: store videos in a specific folder
+                    public_id: `video_${Date.now()}`, // Optional: make unique filenames
+                });
+                videoUrls.push(result.secure_url); // Add the Cloudinary URL of the uploaded video
+            }
 
+            // Ensure titles array has enough titles for all videos
             const paddedTitles = [...titles, ...Array(files.length - titles.length).fill('Untitled')];
 
+            // Combine the video URLs with titles
             const videoWithTitles = videoUrls.map((url, index) => ({
                 video: url,
                 title: paddedTitles[index]
             }));
 
+            // Update the user's video field in the database
             const updateObject = {
                 $push: { videos: { $each: videoWithTitles } }
             };
+
             const result = await usersCollection.updateOne({ email: userEmail }, updateObject);
 
             if (result.modifiedCount > 0) {
-                res.status(200).send({ message: 'Video updated successfully', videos: videoWithTitles });
+                res.status(200).send({ message: 'Videos updated successfully', videos: videoWithTitles });
             } else {
                 res.status(200).send({ message: 'No changes made to the user' });
             }
         } catch (error) {
-            console.error('Error updating gallery:', error);
-            res.status(500).send({ message: 'Error updating gallery', error: error.message });
+            console.error('Error updating videos:', error);
+            res.status(500).send({ message: 'Error updating videos', error: error.message });
         }
     });
+
     app.get('/users/:email/video', async (req, res) => {
         const userEmail = req.params.email;
 
@@ -469,35 +595,46 @@ connectToDB().then(() => {
 
         const titles = Array.isArray(data.titles) ? data.titles : [];
         const descriptions = Array.isArray(data.desc) ? data.desc : [];
-
         const submissionDate = Array.isArray(data.date) ? data.date : [];
+
         try {
             const user = await usersCollection.findOne({ email: userEmail });
             if (!user) {
                 return res.status(404).send({ message: 'User not found' });
             }
-            const blogUrls = files.map(file => `http://localhost:8000/uploads/${file.filename}`);
 
+            // Upload images to Cloudinary and get URLs
+            const blogUrls = [];
+            for (const file of files) {
+                const result = await cloudinary.uploader.upload(file.path, {
+                    folder: 'user_blog_images', // Optional: specify a folder
+                    public_id: `blog_image_${Date.now()}`, // Optional: make filenames unique
+                });
+                blogUrls.push(result.secure_url); // Store the Cloudinary URL
+            }
+
+            // Ensure titles, descriptions, and dates are padded to match the number of images
             const paddedTitles = [...titles, ...Array(files.length - titles.length).fill('Untitled')];
             const paddedDesc = [...descriptions, ...Array(files.length - descriptions.length).fill('No description')];
-
             const paddedDates = [...submissionDate, ...Array(files.length - submissionDate.length).fill(new Date())];
 
-            const blogWithTitlesAndDesc = blogUrls.map((url, index) => ({
+            // Combine URLs, titles, descriptions, and dates into an array
+            const blogWithDetails = blogUrls.map((url, index) => ({
                 image: url,
                 title: paddedTitles[index],
                 desc: paddedDesc[index],
                 date: paddedDates[index],
             }));
 
+            // Update the user's blog field in the database
             const updateObject = {
-                $push: { blog: { $each: blogWithTitlesAndDesc } }
+                $push: { blog: { $each: blogWithDetails } }
             };
 
             const result = await usersCollection.updateOne({ email: userEmail }, updateObject);
 
             if (result.modifiedCount > 0) {
-                res.status(200).send({ message: 'Blog updated successfully', blog: blogWithTitlesAndDesc });
+                res.status(200).send({ message: 'Blog updated successfully', blog: blogWithDetails });
             } else {
                 res.status(200).send({ message: 'No changes made to the user' });
             }
@@ -526,10 +663,10 @@ connectToDB().then(() => {
         const userEmail = req.params.email;
         const files = req.files;
         const data = req.body;
+
         const titles = Array.isArray(data.titles) ? data.titles : [];
         const descriptions = Array.isArray(data.desc) ? data.desc : [];
         const submissionDate = Array.isArray(data.date) ? data.date : [];
-
 
         try {
             const user = await usersCollection.findOne({ email: userEmail });
@@ -537,26 +674,38 @@ connectToDB().then(() => {
                 return res.status(404).send({ message: 'User not found' });
             }
 
-            const newsUrls = files.map(file => `http://localhost:8000/uploads/${file.filename}`);
+            // Upload images to Cloudinary
+            const newsUrls = [];
+            for (const file of files) {
+                const result = await cloudinary.uploader.upload(file.path, {
+                    folder: 'user_news_images', // Optional: specify a folder
+                    public_id: `news_image_${Date.now()}`, // Optional: make filenames unique
+                });
+                newsUrls.push(result.secure_url); // Store the Cloudinary URL
+            }
 
+            // Ensure titles, descriptions, and dates are padded to match the number of images
             const paddedTitles = [...titles, ...Array(files.length - titles.length).fill('Untitled')];
             const paddedDesc = [...descriptions, ...Array(files.length - descriptions.length).fill('No description')];
             const paddedDates = [...submissionDate, ...Array(files.length - submissionDate.length).fill(new Date())];
-            const newsWithTitlesAndDesc = newsUrls.map((url, index) => ({
+
+            // Combine URLs, titles, descriptions, and dates into an array
+            const newsWithDetails = newsUrls.map((url, index) => ({
                 image: url,
                 title: paddedTitles[index],
                 desc: paddedDesc[index],
                 date: paddedDates[index],
             }));
 
+            // Update the user's news field in the database
             const updateObject = {
-                $push: { news: { $each: newsWithTitlesAndDesc } }
+                $push: { news: { $each: newsWithDetails } }
             };
 
             const result = await usersCollection.updateOne({ email: userEmail }, updateObject);
 
             if (result.modifiedCount > 0) {
-                res.status(200).send({ message: 'News updated successfully', news: newsWithTitlesAndDesc });
+                res.status(200).send({ message: 'News updated successfully', news: newsWithDetails });
             } else {
                 res.status(200).send({ message: 'No changes made to the user' });
             }
@@ -565,6 +714,7 @@ connectToDB().then(() => {
             res.status(500).send({ message: 'Error updating news', error: error.message });
         }
     });
+
     app.patch('/users/:email/updatedDraft', upload.array('files'), async (req, res) => {
         const { email } = req.params;
         const { draftData } = req.body;
@@ -575,11 +725,26 @@ connectToDB().then(() => {
             const parsedDraftData = JSON.parse(draftData);
             const activeSection = parsedDraftData.activeSection;
 
-            const filesData = files.map((file, index) => ({
-                title: (parsedDraftData?.[activeSection]?.files[index]?.title) || `File ${index + 1}`,
-                url: `http://localhost:8000/uploads/${file.filename}`,
-                activeSection: activeSection,
-            }));
+            if (!files || files.length === 0) {
+                return res.status(400).json({ message: 'No files uploaded' });
+            }
+
+            // Upload files to Cloudinary and get URLs
+            const filesData = [];
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const result = await cloudinary.uploader.upload(file.path, {
+                    folder: 'user_drafts_files', // Optional: specify a folder in Cloudinary
+                    public_id: `draft_file_${Date.now()}`, // Optional: make filenames unique
+                });
+
+                const fileData = {
+                    title: (parsedDraftData?.[activeSection]?.files[i]?.title) || `File ${i + 1}`,
+                    url: result.secure_url, // Use Cloudinary URL
+                    activeSection: activeSection,
+                };
+                filesData.push(fileData);
+            }
 
             const newDraft = {
                 email,
@@ -588,16 +753,18 @@ connectToDB().then(() => {
                 },
                 createdAt: new Date(),
             };
-            const draftsCollection = client.db('innova_portfolio').collection('drafts');
 
+            const draftsCollection = client.db('innova_portfolio').collection('drafts');
             await draftsCollection.insertOne(newDraft);
-            res.status(201).json({ message: 'New draft saved successfully' });
+
+            res.status(201).json({ message: 'New draft saved successfully', draft: newDraft });
 
         } catch (error) {
             console.error('Error saving draft data:', error);
-            res.status(500).json({ message: 'Error saving draft data' });
+            res.status(500).json({ message: 'Error saving draft data', error: error.message });
         }
     });
+
 
     app.get('/users/:email/updatedDraft', async (req, res) => {
         const { email } = req.params;
@@ -848,16 +1015,30 @@ connectToDB().then(() => {
     app.patch('/users/:email/draft/gallery', upload.array('gallery', 10), async (req, res) => {
         const userEmail = req.params.email;
         const files = req.files;
-        console.log("files", files)
+        console.log("files", files);
         const data = req.body;
         const titles = Array.isArray(data.titles) ? data.titles : [];
+
         try {
             const user = await usersCollection.findOne({ email: userEmail });
             if (!user) {
                 return res.status(404).send({ message: 'User not found' });
             }
 
-            const galleryUrls = files.map(file => `http://localhost:8000/uploads/${file.filename}`);
+            if (!files || files.length === 0) {
+                return res.status(400).send({ message: 'No files uploaded' });
+            }
+
+            // Upload images to Cloudinary and get URLs
+            const galleryUrls = [];
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const result = await cloudinary.uploader.upload(file.path, {
+                    folder: 'user_gallery', // Optional: specify a folder in Cloudinary
+                    public_id: `gallery_image_${Date.now()}`, // Optional: make filenames unique
+                });
+                galleryUrls.push(result.secure_url);
+            }
 
             const paddedTitles = [...titles, ...Array(files.length - titles.length).fill('Untitled')];
 
@@ -882,12 +1063,12 @@ connectToDB().then(() => {
             res.status(500).send({ message: 'Error updating gallery', error: error.message });
         }
     });
+
     app.patch('/users/:email/draft/video', upload.array('videos', 10), async (req, res) => {
         const userEmail = req.params.email;
         const files = req.files;
         const data = req.body;
         const titles = Array.isArray(data.titles) ? data.titles : [];
-
 
         try {
             const user = await usersCollection.findOne({ email: userEmail });
@@ -895,8 +1076,23 @@ connectToDB().then(() => {
                 return res.status(404).send({ message: 'User not found' });
             }
 
-            const videoUrls = files.map(file => `http://localhost:8000/uploads/${file.filename}`);
+            if (!files || files.length === 0) {
+                return res.status(400).send({ message: 'No files uploaded' });
+            }
 
+            // Upload videos to Cloudinary and get URLs
+            const videoUrls = [];
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const result = await cloudinary.uploader.upload(file.path, {
+                    resource_type: 'video',  // Specifies that the file is a video
+                    folder: 'user_videos',  // Optional: specify a folder for videos in Cloudinary
+                    public_id: `video_${Date.now()}`,  // Optional: make the filename unique
+                });
+                videoUrls.push(result.secure_url);  // Save the URL of the uploaded video
+            }
+
+            // Pad titles if there are fewer titles than videos
             const paddedTitles = [...titles, ...Array(files.length - titles.length).fill('Untitled')];
 
             const videoWithTitles = videoUrls.map((url, index) => ({
@@ -904,9 +1100,11 @@ connectToDB().then(() => {
                 title: paddedTitles[index]
             }));
 
+            // Update user with the new video data
             const updateObject = {
                 $push: { videos: { $each: videoWithTitles } }
             };
+
             const result = await usersCollection.updateOne({ email: userEmail }, updateObject);
 
             if (result.modifiedCount > 0) {
@@ -915,10 +1113,11 @@ connectToDB().then(() => {
                 res.status(200).send({ message: 'No changes made to the user' });
             }
         } catch (error) {
-            console.error('Error updating gallery:', error);
-            res.status(500).send({ message: 'Error updating gallery', error: error.message });
+            console.error('Error updating video:', error);
+            res.status(500).send({ message: 'Error updating video', error: error.message });
         }
     });
+
     app.patch('/users/:email/draft/blog', upload.array('blog', 10), async (req, res) => {
         const userEmail = req.params.email;
         const files = req.files;
@@ -926,20 +1125,35 @@ connectToDB().then(() => {
 
         const titles = Array.isArray(data.titles) ? data.titles : [];
         const descriptions = Array.isArray(data.desc) ? data.desc : [];
-
         const submissionDate = Array.isArray(data.date) ? data.date : [];
+
         try {
             const user = await usersCollection.findOne({ email: userEmail });
             if (!user) {
                 return res.status(404).send({ message: 'User not found' });
             }
-            const blogUrls = files.map(file => `http://localhost:8000/uploads/${file.filename}`);
 
+            if (!files || files.length === 0) {
+                return res.status(400).send({ message: 'No files uploaded' });
+            }
+
+            // Upload each blog image to Cloudinary and get the URLs
+            const blogUrls = [];
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const result = await cloudinary.uploader.upload(file.path, {
+                    folder: 'user_blogs',  // Optional: specify a folder in Cloudinary
+                    public_id: `blog_image_${Date.now()}`,  // Unique ID for each image
+                });
+                blogUrls.push(result.secure_url);  // Save the URL of the uploaded image
+            }
+
+            // Pad titles, descriptions, and submission dates if necessary
             const paddedTitles = [...titles, ...Array(files.length - titles.length).fill('Untitled')];
             const paddedDesc = [...descriptions, ...Array(files.length - descriptions.length).fill('No description')];
-
             const paddedDates = [...submissionDate, ...Array(files.length - submissionDate.length).fill(new Date())];
 
+            // Combine the image URLs with the title, description, and date for each blog post
             const blogWithTitlesAndDesc = blogUrls.map((url, index) => ({
                 image: url,
                 title: paddedTitles[index],
@@ -947,6 +1161,7 @@ connectToDB().then(() => {
                 date: paddedDates[index],
             }));
 
+            // Update the user's blog data
             const updateObject = {
                 $push: { blog: { $each: blogWithTitlesAndDesc } }
             };
@@ -963,6 +1178,7 @@ connectToDB().then(() => {
             res.status(500).send({ message: 'Error updating blog', error: error.message });
         }
     });
+
     app.patch('/users/:email/draft/news', upload.array('news', 10), async (req, res) => {
         const userEmail = req.params.email;
         const files = req.files;
@@ -970,17 +1186,34 @@ connectToDB().then(() => {
         const titles = Array.isArray(data.titles) ? data.titles : [];
         const descriptions = Array.isArray(data.desc) ? data.desc : [];
         const submissionDate = Array.isArray(data.date) ? data.date : [];
+
         try {
             const user = await usersCollection.findOne({ email: userEmail });
             if (!user) {
                 return res.status(404).send({ message: 'User not found' });
             }
 
-            const newsUrls = files.map(file => `http://localhost:8000/uploads/${file.filename}`);
+            if (!files || files.length === 0) {
+                return res.status(400).send({ message: 'No files uploaded' });
+            }
 
+            // Upload each news image to Cloudinary and get the URLs
+            const newsUrls = [];
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const result = await cloudinary.uploader.upload(file.path, {
+                    folder: 'user_news',  // Optional: specify a folder in Cloudinary
+                    public_id: `news_image_${Date.now()}`,  // Unique ID for each image
+                });
+                newsUrls.push(result.secure_url);  // Save the URL of the uploaded image
+            }
+
+            // Pad titles, descriptions, and submission dates if necessary
             const paddedTitles = [...titles, ...Array(files.length - titles.length).fill('Untitled')];
             const paddedDesc = [...descriptions, ...Array(files.length - descriptions.length).fill('No description')];
             const paddedDates = [...submissionDate, ...Array(files.length - submissionDate.length).fill(new Date())];
+
+            // Combine the image URLs with the title, description, and date for each news post
             const newsWithTitlesAndDesc = newsUrls.map((url, index) => ({
                 image: url,
                 title: paddedTitles[index],
@@ -988,6 +1221,7 @@ connectToDB().then(() => {
                 date: paddedDates[index],
             }));
 
+            // Update the user's news data
             const updateObject = {
                 $push: { news: { $each: newsWithTitlesAndDesc } }
             };
@@ -1004,6 +1238,7 @@ connectToDB().then(() => {
             res.status(500).send({ message: 'Error updating news', error: error.message });
         }
     });
+
 
     app.get('/users/:email/draft/gallery', async (req, res) => {
         const userEmail = req.params.email;
